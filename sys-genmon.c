@@ -33,6 +33,7 @@ TMP="$(mktemp -d)"; cc -o "$TMP/a.out" -x c "$0" && "$TMP/a.out" $@; RVAL=$?; rm
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define MAX_NUM_CPUS 256
@@ -47,7 +48,8 @@ TMP="$(mktemp -d)"; cc -o "$TMP/a.out" -x c "$0" && "$TMP/a.out" $@; RVAL=$?; rm
 #define ANSI_COLOR_RESET "\x1b[0m"
 
 #define CPU_COLORS "#3498DB", "#2471A3"
-#define GPU_COLORS "#76B900", "#27AE60"
+#define NVIDIA_GPU_COLORS "#76B900", "#27AE60"
+#define AMD_GPU_COLORS "#ED1C24", "#C41E3A"
 #define MEM_COLOR "#F1C40F"
 #define SWP_COLOR "#8E44AD"
 #define VRAM_COLOR "#BADC00"
@@ -112,30 +114,80 @@ typedef struct cpu_record cpu_record;
 typedef struct gpu_record gpu_record;
 typedef struct mem_record mem_record;
 
-static struct cpu_record *prev_cpu_info = NULL;
+#define GPU_VENDOR_UNKNOWN 0
+#define GPU_VENDOR_NVIDIA 1
+#define GPU_VENDOR_AMD 2
+#define GPU_VENDOR_NONE 3
+
+struct shm_data {
+  cpu_record prev_cpu;
+  char amd_gpu_names[MAX_NUM_GPUS][256];
+  uint8_t amd_gpu_count;
+  uint8_t gpu_vendor;
+  uint8_t initialized;
+};
+
+static struct shm_data *shm = NULL;
 static const char *tmp_svg = "/tmp/sys-genmon.svg";
 static const char *shm_name = "/genmon_shmem";
-static const char *nvsmi_cmd = "nvidia-smi "
-                               "--query-gpu="
-                               "gpu_name,"
-                               "utilization.gpu,"
-                               "utilization.memory,"
-                               "memory.total,"
-                               "memory.used,"
-                               "memory.free,"
-                               "clocks.current.graphics,"
-                               "clocks.current.memory,"
-                               "clocks.current.video,"
-                               "power.draw,"
-                               "temperature.gpu "
-                               "--format=csv,noheader,nounits "
-                               "2> /dev/null";
-static const char *amdsmi_cmd = "amd-smi "
-                                "monitor "
-                                "--csv";
-static const char *amdname_cmd = "amd-smi "
-                                 "static "
-                                 "--csv ";
+static char *nvsmi_argv[] = {
+    "/usr/bin/nvidia-smi",
+    "--query-gpu="
+    "gpu_name,"
+    "utilization.gpu,"
+    "utilization.memory,"
+    "memory.total,"
+    "memory.used,"
+    "memory.free,"
+    "clocks.current.graphics,"
+    "clocks.current.memory,"
+    "clocks.current.video,"
+    "power.draw,"
+    "temperature.gpu",
+    "--format=csv,noheader,nounits",
+    NULL};
+static char *amdsmi_monitor_argv[] = {"/usr/bin/amd-smi", "monitor", "--csv", NULL};
+static char *amdsmi_static_argv[] = {"/usr/bin/amd-smi", "static", "--csv", NULL};
+
+// Helper to run a command and capture output via fork+exec
+static inline ssize_t run_cmd(char *const argv[], char *buf, size_t buf_size) {
+  int pipefd[2];
+  if (pipe(pipefd) == -1)
+    return -1;
+
+  pid_t pid = fork();
+  if (pid == -1) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    // Child process
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    close(pipefd[1]);
+    execv(argv[0], argv);
+    _exit(127);
+  }
+
+  // Parent process
+  close(pipefd[1]);
+  ssize_t total = 0;
+  ssize_t n;
+  while ((n = read(pipefd[0], buf + total, buf_size - total - 1)) > 0)
+    total += n;
+  close(pipefd[0]);
+
+  int status;
+  waitpid(pid, &status, 0);
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    return -1;
+
+  buf[total] = '\0';
+  return total;
+}
 
 static inline uint32_t str_to_u32(char *s, int *err) {
 #if UINT32_MAX <= ULONG_MAX
@@ -304,62 +356,76 @@ static inline void get_nvidia_info(struct gpu_record *gpu, char*contents) {
   }
 }
 
-static inline void get_amd_info(struct gpu_record *gpu, char*contents) {
-  // char*header = "gpu,xcp,power_usage,hotspot_temperature,memory_temperature,gfx_clk,gfx,mem,encoder,decoder,vram_used,vram_total\n";
-  // if (!starts_with(contents, header)) {
-  //   return;
-  // }
+static inline int get_amd_gpu_names(void) {
+  if (shm->amd_gpu_count > 0)
+    return 1;
 
-  char *line = contents;
-  while (*line != '\n') {
-    line++;
+  char static_contents[PAGE_SIZE * MAX_NUM_GPUS];
+  ssize_t n_read = run_cmd(amdsmi_static_argv, static_contents, sizeof(static_contents));
+  if (n_read <= 0)
+    return 0;
+
+  // Skip header line
+  char *p = static_contents;
+  while (*p && *p != '\n')
+    p++;
+  if (*p) p++;
+
+  // Parse each GPU line
+  while (*p && shm->amd_gpu_count < MAX_NUM_GPUS) {
+    // Skip gpu id column (e.g. "0,")
+    while (*p && *p != ',')
+      p++;
+    if (*p == ',') p++;
+
+    // Copy name until delimiter
+    char *dst = shm->amd_gpu_names[shm->amd_gpu_count];
+    while (*p && *p != ',' && *p != '\n')
+      *dst++ = *p++;
+    *dst = '\0';
+
+    // Skip to next line
+    while (*p && *p != '\n')
+      p++;
+    if (*p == '\n') p++;
+
+    shm->amd_gpu_count++;
   }
+
+  return shm->amd_gpu_count > 0;
+}
+
+static inline void get_amd_info(struct gpu_record *gpu, char *contents) {
+  // Skip header line
+  char *line = contents;
+  while (*line != '\n')
+    line++;
   line++;
 
-  FILE *fp = popen(amdname_cmd, "r");
-  char static_contents[PAGE_SIZE * MAX_NUM_GPUS];
-  size_t n_read = fread(static_contents, 1, sizeof(static_contents) - 1, fp);
-  int status = pclose(fp);
-  if (!n_read || status != 0) {
-    // No output or nvidia-smi failed, no GPUs
+  if (!get_amd_gpu_names())
     return;
-  }
-  static_contents[n_read] = '\0';
 
-  char *static_line = static_contents;
-  while (*static_line != '\n') {
-    static_line++;
-  }
-  static_line+=3;
-
-  char *gpu_name = static_line;
-  static_line = next_amdgpu_item(static_line);
-
+  // Fields: gpu,xcp,power_usage,hotspot_temperature,memory_temperature,
+  //         gfx_clk,gfx,mem,encoder,decoder,vram_used,vram_total
   for (size_t i = 0; i < MAX_NUM_GPUS; i++) {
-    if (*line == '\n') break;
+    if (*line == '\n')
+      break;
 
-    char *gpuid = line;
-    line = next_amdgpu_item(line);
-    char *xcp = line;
-    line = next_amdgpu_item(line);
+    line = next_amdgpu_item(line); // gpu
+    line = next_amdgpu_item(line); // xcp
 
     char *power_usage = line;
     line = next_amdgpu_item(line);
     char *hotspot_temperature = line;
     line = next_amdgpu_item(line);
-    char *memory_temperature = line;
-    line = next_amdgpu_item(line);
+    line = next_amdgpu_item(line); // memory_temperature
     char *gfx_clk = line;
     line = next_amdgpu_item(line);
     char *gfx = line;
     line = next_amdgpu_item(line);
-    char *mem = line;
-    line = next_amdgpu_item(line);
-
-    char *encoder = line;
-    line = next_amdgpu_item(line);
-    char *decoder = line;
-    line = next_amdgpu_item(line);
+    line = next_amdgpu_item(line); // mem
+    line = next_amdgpu_item(line); // encoder
+    line = next_amdgpu_item(line); // decoder
 
     char *vram_used = line;
     line = next_amdgpu_item(line);
@@ -367,21 +433,14 @@ static inline void get_amd_info(struct gpu_record *gpu, char*contents) {
     line = next_amdgpu_item(line);
 
     int err = 0;
-
-    strcpy(gpu->gpu[i].gpu_name, gpu_name);
+    strcpy(gpu->gpu[i].gpu_name, shm->amd_gpu_names[i < shm->amd_gpu_count ? i : 0]);
     gpu->gpu[i].gpu_sm_utilization = str_to_u32(gfx, &err);
-    // gpu->gpu[i].gpu_mem_bandwidth_utilization =
-    //     str_to_u32(gpu_mem_bandwidth_utilization, &err);
     gpu->gpu[i].gpu_mem_total = str_to_u32(vram_total, &err);
     gpu->gpu[i].gpu_mem_used = str_to_u32(vram_used, &err);
     gpu->gpu[i].gpu_mem_free = gpu->gpu[i].gpu_mem_total - gpu->gpu[i].gpu_mem_used;
     gpu->gpu[i].gpu_mem_used_percentage =
-        100.0 *
-        ((float)gpu->gpu[i].gpu_mem_used /
-         (float)gpu->gpu[i].gpu_mem_total); // Leave as nan if no gpu mem
+        100.0 * ((float)gpu->gpu[i].gpu_mem_used / (float)gpu->gpu[i].gpu_mem_total);
     gpu->gpu[i].gpu_graphics_clock = str_to_u32(gfx_clk, &err);
-    // gpu->gpu[i].gpu_mem_clock = str_to_u32(gpu_mem_clock, &err);
-    // gpu->gpu[i].gpu_video_clock = str_to_u32(gpu_video_clock, &err);
     gpu->gpu[i].gpu_power_draw = str_to_u32(power_usage, &err);
     gpu->gpu[i].gpu_temp = str_to_u32(hotspot_temperature, &err);
     if (err)
@@ -395,36 +454,41 @@ static inline void get_amd_info(struct gpu_record *gpu, char*contents) {
 
 static inline void get_gpu_info(struct gpu_record *gpu) {
   gpu->num_gpus = 0;
-
-  FILE *fp = popen(nvsmi_cmd, "r");
-  // fread into a big static buffer, and null terminate.
   char contents[PAGE_SIZE * MAX_NUM_GPUS];
-  size_t n_read = fread(contents, 1, sizeof(contents) - 1, fp);
-  if (n_read != 0) {
-    contents[n_read] = '\0';
+  ssize_t n_read;
+
+  // Use cached vendor if known
+  switch (shm->gpu_vendor) {
+  case GPU_VENDOR_NVIDIA:
+    n_read = run_cmd(nvsmi_argv, contents, sizeof(contents));
+    if (n_read > 0)
+      get_nvidia_info(gpu, contents);
+    return;
+  case GPU_VENDOR_AMD:
+    n_read = run_cmd(amdsmi_monitor_argv, contents, sizeof(contents));
+    if (n_read > 0)
+      get_amd_info(gpu, contents);
+    return;
+  case GPU_VENDOR_NONE:
+    return;
+  }
+
+  // Unknown vendor - detect and cache
+  n_read = run_cmd(nvsmi_argv, contents, sizeof(contents));
+  if (n_read > 0) {
+    shm->gpu_vendor = GPU_VENDOR_NVIDIA;
     get_nvidia_info(gpu, contents);
     return;
   }
-  pclose(fp);
 
-  fp = popen(amdsmi_cmd, "r");
-  if (fp){
-    // fread into a big static buffer, and null terminate.
-    char contents[PAGE_SIZE * MAX_NUM_GPUS];
-    size_t n_read = fread(contents, 1, sizeof(contents) - 1, fp);
-    int status = pclose(fp);
-    if (!n_read || status != 0) {
-      // No output or amd-smi failed, no GPUs
-      return;
-    }
-    contents[n_read] = '\0';
-
+  n_read = run_cmd(amdsmi_monitor_argv, contents, sizeof(contents));
+  if (n_read > 0) {
+    shm->gpu_vendor = GPU_VENDOR_AMD;
     get_amd_info(gpu, contents);
     return;
   }
 
-  // No GPUS found, return
-  return;
+  shm->gpu_vendor = GPU_VENDOR_NONE;
 }
 
 static inline void get_cpu_info(cpu_record *cpu) {
@@ -640,9 +704,9 @@ static inline float *calculate_cpu_utilization(cpu_record *prev,
   return utilization;
 }
 
-static inline void get_prev_cpu_info() {
+static inline void get_prev_cpu_info(void) {
   const size_t psm1 = PAGE_SIZE - 1;
-  const size_t shm_size = (sizeof(cpu_record) + 1 + psm1) & ~psm1;
+  const size_t shm_size = (sizeof(struct shm_data) + psm1) & ~psm1;
 
   // Open the shared memory file.
   int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
@@ -653,35 +717,21 @@ static inline void get_prev_cpu_info() {
   if (ftruncate(fd, shm_size) == -1)
     puts("Failed to ftruncate the shared memory file."), exit(1);
 
-  char *shm_contents =
-      mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (shm_contents == MAP_FAILED)
+  shm = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (shm == MAP_FAILED)
     puts("Failed to mmap the shared memory file."), exit(1);
 
-  // Dispose of the file descriptor.
   close(fd);
 
-  // Check if it's the first time this process has been run.
-  // If it is, we need to take new measurments and pack it in, so that we have a
-  // reference point.
-  char *flagptr = shm_contents + sizeof(cpu_record);
-  if (*flagptr == '\0') {
-    *flagptr = 1;
-    get_cpu_info((cpu_record *)shm_contents);
-  }
-
-  // Check if it's the first time this function has been run in the current
-  // process. If it is, yoink the shm_contents buffer. Or copy and unmap.
-  if (!prev_cpu_info) {
-    prev_cpu_info = (cpu_record *)shm_contents;
-  } else {
-    memcpy(prev_cpu_info, shm_contents, sizeof(cpu_record));
-    munmap(shm_contents, shm_size);
+  // First run: initialize CPU baseline
+  if (!shm->initialized) {
+    shm->initialized = 1;
+    get_cpu_info(&shm->prev_cpu);
   }
 }
 
 static inline void save_cpu_shm(cpu_record *cpu) {
-  memcpy((char *)prev_cpu_info, cpu, sizeof(cpu_record));
+  memcpy(&shm->prev_cpu, cpu, sizeof(cpu_record));
 }
 
 // Print results
@@ -905,8 +955,10 @@ static inline size_t print_svg_rects(char *buf, size_t buf_len) {
   cols_printed++;
 
   // GPU utilization and VRAM usage (paired per GPU)
-  const char *gpu_colors[] = {GPU_COLORS};
-  const size_t num_gpu_colors = sizeof(gpu_colors) / sizeof(gpu_colors[0]);
+  const char *nv_colors[] = {NVIDIA_GPU_COLORS};
+  const char *amd_colors[] = {AMD_GPU_COLORS};
+  const char **gpu_colors = shm->gpu_vendor == GPU_VENDOR_AMD ? amd_colors : nv_colors;
+  const size_t num_gpu_colors = 2;
   for (size_t i = 0; i < num_gpus; i++) {
     // GPU SM utilization
     PRN("<rect width='3' height='%zu%%' x='%zu' y='0' fill='%s' />\n",
@@ -1010,9 +1062,10 @@ static inline size_t print_tui(char *buf, size_t buf_len) {
   PRN("  Free:  %" PRIu32 " MB\n\n", info.mem_info.swp_free / 1024);
 
   // GPU Information
+  const char *gpu_color = shm->gpu_vendor == GPU_VENDOR_AMD ? ANSI_COLOR_RED : ANSI_COLOR_GREEN;
   if (info.gpu_info.num_gpus == 1) {
     struct gpu_instance *g = &info.gpu_info.gpu[0];
-    PRN(ANSI_COLOR_GREEN "GPU Information:" ANSI_COLOR_RESET "\n");
+    PRN("%sGPU Information:" ANSI_COLOR_RESET "\n", gpu_color);
     PRN("  Name: %s\n", g->gpu_name);
     PRN("  SM Utilization:     %" PRIu32 "%%\n", g->gpu_sm_utilization);
     PRN("  Memory Usage:    %.2f%% (%f GiB / %u GiB)\n",
@@ -1022,7 +1075,7 @@ static inline size_t print_tui(char *buf, size_t buf_len) {
     PRN("  Power Draw:      %" PRIu32 " W\n", g->gpu_power_draw);
     PRN("\n");
   } else if (info.gpu_info.num_gpus > 1) {
-    PRN(ANSI_COLOR_GREEN "GPU Information:" ANSI_COLOR_RESET "\n");
+    PRN("%sGPU Information:" ANSI_COLOR_RESET "\n", gpu_color);
     for (size_t i = 0; i < info.gpu_info.num_gpus; i++) {
       struct gpu_instance *g = &info.gpu_info.gpu[i];
       PRN("  GPU %zu: %s\n", i, g->gpu_name);
@@ -1077,12 +1130,11 @@ static inline void calculate_utilizations(void) {
   get_gpu_info(&info.gpu_info);
   get_mem_info(&info.mem_info);
   get_cpu_info(&info.cpu_info);
-  calculate_cpu_utilization(prev_cpu_info, &info.cpu_info);
+  calculate_cpu_utilization(&shm->prev_cpu, &info.cpu_info);
   save_cpu_shm(&info.cpu_info);
 }
 
 int main(int argc, char **argv) {
-
   Args args = argparse(argc, argv);
 
   char buf[4096 * 20];
