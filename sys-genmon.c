@@ -52,7 +52,8 @@ TMP="$(mktemp -d)"; cc -o "$TMP/a.out" -x c "$0" && "$TMP/a.out" $@; RVAL=$?; rm
 #define AMD_GPU_COLORS "#ED1C24", "#C41E3A"
 #define MEM_COLOR "#F1C40F"
 #define SWP_COLOR "#8E44AD"
-#define VRAM_COLOR "#BADC00"
+#define NVIDIA_VRAM_COLOR "#BADC00"
+#define AMD_VRAM_COLOR "#FF6B6B"
 
 #define PAGE_SIZE 4096
 
@@ -957,7 +958,9 @@ static inline size_t print_svg_rects(char *buf, size_t buf_len) {
   // GPU utilization and VRAM usage (paired per GPU)
   const char *nv_colors[] = {NVIDIA_GPU_COLORS};
   const char *amd_colors[] = {AMD_GPU_COLORS};
-  const char **gpu_colors = shm->gpu_vendor == GPU_VENDOR_AMD ? amd_colors : nv_colors;
+  int is_amd = shm->gpu_vendor == GPU_VENDOR_AMD;
+  const char **gpu_colors = is_amd ? amd_colors : nv_colors;
+  const char *vram_color = is_amd ? AMD_VRAM_COLOR : NVIDIA_VRAM_COLOR;
   const size_t num_gpu_colors = 2;
   for (size_t i = 0; i < num_gpus; i++) {
     // GPU SM utilization
@@ -970,7 +973,7 @@ static inline size_t print_svg_rects(char *buf, size_t buf_len) {
     // VRAM usage for this GPU
     PRN("<rect width='3' height='%zu%%' x='%zu' y='0' fill='%s' />\n",
         (size_t)info.gpu_info.gpu[i].gpu_mem_used_percentage,
-        (margin_col_width * cols_printed + first_margin), VRAM_COLOR);
+        (margin_col_width * cols_printed + first_margin), vram_color);
     cols_printed++;
   }
 
