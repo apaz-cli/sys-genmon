@@ -128,7 +128,14 @@ static const char *nvsmi_cmd = "nvidia-smi "
                                "clocks.current.video,"
                                "power.draw,"
                                "temperature.gpu "
-                               "--format=csv,noheader,nounits";
+                               "--format=csv,noheader,nounits "
+                               "2> /dev/null";
+static const char *amdsmi_cmd = "amd-smi "
+                                "monitor "
+                                "--csv";
+static const char *amdname_cmd = "amd-smi "
+                                 "static "
+                                 "--csv ";
 
 static inline uint32_t str_to_u32(char *s, int *err) {
 #if UINT32_MAX <= ULONG_MAX
@@ -231,26 +238,18 @@ static inline char *next_gpu_item(char *line) {
   }
 }
 
-static inline void get_gpu_info(struct gpu_record *gpu) {
-  gpu->num_gpus = 0;
-
-  FILE *fp = popen(nvsmi_cmd, "r");
-  if (!fp) {
-    // nvidia-smi not available, no GPUs
-    return;
+static inline char *next_amdgpu_item(char *line) {
+  while (1) {
+    int lc = *line == ',';
+    int ln = *line == '\n';
+    if (lc | ln)
+      return *line = '\0', line+1;
+    line++;
   }
+}
 
-  // fread into a big static buffer, and null terminate.
-  char nvsmi_contents[PAGE_SIZE * MAX_NUM_GPUS];
-  size_t n_read = fread(nvsmi_contents, 1, sizeof(nvsmi_contents) - 1, fp);
-  int status = pclose(fp);
-  if (!n_read || status != 0) {
-    // No output or nvidia-smi failed, no GPUs
-    return;
-  }
-  nvsmi_contents[n_read] = '\0';
-
-  char *line = nvsmi_contents;
+static inline void get_nvidia_info(struct gpu_record *gpu, char*contents) {
+  char *line = contents;
   for (size_t i = 0; i < MAX_NUM_GPUS; i++) {
 
     char *gpu_name = line;
@@ -303,6 +302,129 @@ static inline void get_gpu_info(struct gpu_record *gpu) {
     if (!*line)
       break;
   }
+}
+
+static inline void get_amd_info(struct gpu_record *gpu, char*contents) {
+  // char*header = "gpu,xcp,power_usage,hotspot_temperature,memory_temperature,gfx_clk,gfx,mem,encoder,decoder,vram_used,vram_total\n";
+  // if (!starts_with(contents, header)) {
+  //   return;
+  // }
+
+  char *line = contents;
+  while (*line != '\n') {
+    line++;
+  }
+  line++;
+
+  FILE *fp = popen(amdname_cmd, "r");
+  char static_contents[PAGE_SIZE * MAX_NUM_GPUS];
+  size_t n_read = fread(static_contents, 1, sizeof(static_contents) - 1, fp);
+  int status = pclose(fp);
+  if (!n_read || status != 0) {
+    // No output or nvidia-smi failed, no GPUs
+    return;
+  }
+  static_contents[n_read] = '\0';
+
+  char *static_line = static_contents;
+  while (*static_line != '\n') {
+    static_line++;
+  }
+  static_line+=3;
+
+  char *gpu_name = static_line;
+  static_line = next_amdgpu_item(static_line);
+
+  for (size_t i = 0; i < MAX_NUM_GPUS; i++) {
+    if (*line == '\n') break;
+
+    char *gpuid = line;
+    line = next_amdgpu_item(line);
+    char *xcp = line;
+    line = next_amdgpu_item(line);
+
+    char *power_usage = line;
+    line = next_amdgpu_item(line);
+    char *hotspot_temperature = line;
+    line = next_amdgpu_item(line);
+    char *memory_temperature = line;
+    line = next_amdgpu_item(line);
+    char *gfx_clk = line;
+    line = next_amdgpu_item(line);
+    char *gfx = line;
+    line = next_amdgpu_item(line);
+    char *mem = line;
+    line = next_amdgpu_item(line);
+
+    char *encoder = line;
+    line = next_amdgpu_item(line);
+    char *decoder = line;
+    line = next_amdgpu_item(line);
+
+    char *vram_used = line;
+    line = next_amdgpu_item(line);
+    char *vram_total = line;
+    line = next_amdgpu_item(line);
+
+    int err = 0;
+
+    strcpy(gpu->gpu[i].gpu_name, gpu_name);
+    gpu->gpu[i].gpu_sm_utilization = str_to_u32(gfx, &err);
+    // gpu->gpu[i].gpu_mem_bandwidth_utilization =
+    //     str_to_u32(gpu_mem_bandwidth_utilization, &err);
+    gpu->gpu[i].gpu_mem_total = str_to_u32(vram_total, &err);
+    gpu->gpu[i].gpu_mem_used = str_to_u32(vram_used, &err);
+    gpu->gpu[i].gpu_mem_free = gpu->gpu[i].gpu_mem_total - gpu->gpu[i].gpu_mem_used;
+    gpu->gpu[i].gpu_mem_used_percentage =
+        100.0 *
+        ((float)gpu->gpu[i].gpu_mem_used /
+         (float)gpu->gpu[i].gpu_mem_total); // Leave as nan if no gpu mem
+    gpu->gpu[i].gpu_graphics_clock = str_to_u32(gfx_clk, &err);
+    // gpu->gpu[i].gpu_mem_clock = str_to_u32(gpu_mem_clock, &err);
+    // gpu->gpu[i].gpu_video_clock = str_to_u32(gpu_video_clock, &err);
+    gpu->gpu[i].gpu_power_draw = str_to_u32(power_usage, &err);
+    gpu->gpu[i].gpu_temp = str_to_u32(hotspot_temperature, &err);
+    if (err)
+      puts("Failed to parse amd-smi output."), exit(1);
+
+    gpu->num_gpus++;
+    if (!*line)
+      break;
+  }
+}
+
+static inline void get_gpu_info(struct gpu_record *gpu) {
+  gpu->num_gpus = 0;
+
+  FILE *fp = popen(nvsmi_cmd, "r");
+  // fread into a big static buffer, and null terminate.
+  char contents[PAGE_SIZE * MAX_NUM_GPUS];
+  size_t n_read = fread(contents, 1, sizeof(contents) - 1, fp);
+  if (n_read != 0) {
+    contents[n_read] = '\0';
+    get_nvidia_info(gpu, contents);
+    return;
+  }
+  pclose(fp);
+
+  fp = popen(amdsmi_cmd, "r");
+  if (fp){
+    // fread into a big static buffer, and null terminate.
+    char contents[PAGE_SIZE * MAX_NUM_GPUS];
+    size_t n_read = fread(contents, 1, sizeof(contents) - 1, fp);
+    int status = pclose(fp);
+    if (!n_read || status != 0) {
+      // No output or amd-smi failed, no GPUs
+      return;
+    }
+    contents[n_read] = '\0';
+
+    get_amd_info(gpu, contents);
+    return;
+  }
+
+  // No GPUS found, return
+  return;
 }
 
 static inline void get_cpu_info(cpu_record *cpu) {
