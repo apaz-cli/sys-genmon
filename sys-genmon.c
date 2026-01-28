@@ -146,8 +146,8 @@ static char *nvsmi_argv[] = {
     "temperature.gpu",
     "--format=csv,noheader,nounits",
     NULL};
-static char *amdsmi_monitor_argv[] = {"/usr/bin/amd-smi", "monitor", "--csv", NULL};
-static char *amdsmi_static_argv[] = {"/usr/bin/amd-smi", "static", "--csv", NULL};
+static char *amdsmi_monitor_argv[] = {"/opt/rocm/bin/amd-smi", "monitor", "--csv", NULL};
+static char *amdsmi_static_argv[] = {"/opt/rocm/bin/amd-smi", "static", "--csv", NULL};
 
 // Helper to run a command and capture output via fork+exec
 static inline ssize_t run_cmd(char *const argv[], char *buf, size_t buf_size) {
