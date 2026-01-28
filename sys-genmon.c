@@ -3,7 +3,7 @@ TMP="$(mktemp -d)"; cc -o "$TMP/a.out" -x c "$0" && "$TMP/a.out" $@; RVAL=$?; rm
 #endif
 
 // Requires linux 2.6.33 (Released Feb 2010) or later.
-// Assumes that the number of CPUs doesn't change while the program is running.
+// Assumes that the number of CPUs/GPUs doesn't change while the program is running.
 
 // Statistics that I care about:
 // --------------------------------
@@ -782,19 +782,18 @@ static inline size_t print_svg_rects(char *buf, size_t buf_len) {
       (margin_col_width * cols_printed + first_margin), SWP_COLOR);
   cols_printed++;
 
-  // GPU utilization
+  // GPU utilization and VRAM usage (paired per GPU)
   const char *gpu_colors[] = {GPU_COLORS};
   const size_t num_gpu_colors = sizeof(gpu_colors) / sizeof(gpu_colors[0]);
   for (size_t i = 0; i < num_gpus; i++) {
+    // GPU SM utilization
     PRN("<rect width='3' height='%zu%%' x='%zu' y='0' fill='%s' />\n",
         (size_t)info.gpu_info.gpu[i].gpu_sm_utilization,
         (margin_col_width * cols_printed + first_margin),
         gpu_colors[i % num_gpu_colors]);
     cols_printed++;
-  }
 
-  // VRAM usage
-  for (size_t i = 0; i < num_gpus; i++) {
+    // VRAM usage for this GPU
     PRN("<rect width='3' height='%zu%%' x='%zu' y='0' fill='%s' />\n",
         (size_t)info.gpu_info.gpu[i].gpu_mem_used_percentage,
         (margin_col_width * cols_printed + first_margin), VRAM_COLOR);
