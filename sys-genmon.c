@@ -1062,11 +1062,13 @@ static inline size_t print_tui(char *buf, size_t buf_len) {
   PRN("  Free:  %" PRIu32 " MB\n\n", info.mem_info.mem_free / 1024);
 
   // Swap Usage
-  PRN(ANSI_COLOR_MAGENTA "Swap Usage: " ANSI_COLOR_RESET "%.2f%%\n",
-      info.mem_info.swp_percentage);
-  PRN("  Total: %" PRIu32 " MB\n", info.mem_info.swp_total / 1024);
-  PRN("  Used:  %" PRIu32 " MB\n", info.mem_info.swp_used / 1024);
-  PRN("  Free:  %" PRIu32 " MB\n\n", info.mem_info.swp_free / 1024);
+  if (info.mem_info.swp_percentage == info.mem_info.swp_percentage) {
+    PRN(ANSI_COLOR_MAGENTA "Swap Usage: " ANSI_COLOR_RESET "%.2f%%\n",
+        info.mem_info.swp_percentage);
+    PRN("  Total: %" PRIu32 " MB\n", info.mem_info.swp_total / 1024);
+    PRN("  Used:  %" PRIu32 " MB\n", info.mem_info.swp_used / 1024);
+    PRN("  Free:  %" PRIu32 " MB\n\n", info.mem_info.swp_free / 1024);
+  }
 
   // GPU Information
   const char *gpu_color = shm->gpu_vendor == GPU_VENDOR_AMD ? ANSI_COLOR_RED : ANSI_COLOR_GREEN;
