@@ -950,10 +950,12 @@ static inline size_t print_svg_rects(char *buf, size_t buf_len) {
   cols_printed++;
 
   // Swap usage
-  PRN("<rect width='3' height='%zu%%' x='%zu' y='0' fill='%s' />\n",
-      (size_t)info.mem_info.swp_percentage,
-      (margin_col_width * cols_printed + first_margin), SWP_COLOR);
-  cols_printed++;
+  if (info.mem_info.swp_percentage == info.mem_info.swp_percentage) {
+    PRN("<rect width='3' height='%zu%%' x='%zu' y='0' fill='%s' />\n",
+        (size_t)info.mem_info.swp_percentage,
+        (margin_col_width * cols_printed + first_margin), SWP_COLOR);
+    cols_printed++;
+  }
 
   // GPU utilization and VRAM usage (paired per GPU)
   const char *nv_colors[] = {NVIDIA_GPU_COLORS};
@@ -990,7 +992,9 @@ static inline void write_svg_file(char *buf, size_t buf_len, int topdown) {
   size_t width = 1; // start margin and 3px plus 1px margin for each rect
   width += info.cpu_info.num_cpus * 4; // cpu utilization
   width += 4;                          // mem
-  width += 4;                          // swap
+  if (info.mem_info.swp_percentage == info.mem_info.swp_percentage) {
+    width += 4;                        // swap
+  }
   width += info.gpu_info.num_gpus * 4; // gpu utilization
   width += info.gpu_info.num_gpus * 4; // vram
 
@@ -1058,11 +1062,13 @@ static inline size_t print_tui(char *buf, size_t buf_len) {
   PRN("  Free:  %" PRIu32 " MB\n\n", info.mem_info.mem_free / 1024);
 
   // Swap Usage
-  PRN(ANSI_COLOR_MAGENTA "Swap Usage: " ANSI_COLOR_RESET "%.2f%%\n",
-      info.mem_info.swp_percentage);
-  PRN("  Total: %" PRIu32 " MB\n", info.mem_info.swp_total / 1024);
-  PRN("  Used:  %" PRIu32 " MB\n", info.mem_info.swp_used / 1024);
-  PRN("  Free:  %" PRIu32 " MB\n\n", info.mem_info.swp_free / 1024);
+  if (info.mem_info.swp_percentage == info.mem_info.swp_percentage) {
+    PRN(ANSI_COLOR_MAGENTA "Swap Usage: " ANSI_COLOR_RESET "%.2f%%\n",
+        info.mem_info.swp_percentage);
+    PRN("  Total: %" PRIu32 " MB\n", info.mem_info.swp_total / 1024);
+    PRN("  Used:  %" PRIu32 " MB\n", info.mem_info.swp_used / 1024);
+    PRN("  Free:  %" PRIu32 " MB\n\n", info.mem_info.swp_free / 1024);
+  }
 
   // GPU Information
   const char *gpu_color = shm->gpu_vendor == GPU_VENDOR_AMD ? ANSI_COLOR_RED : ANSI_COLOR_GREEN;
