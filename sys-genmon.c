@@ -147,8 +147,9 @@ static char *nvsmi_argv[] = {
     "temperature.gpu",
     "--format=csv,noheader,nounits",
     NULL};
-static char *amdsmi_monitor_argv[] = {"/opt/rocm/bin/amd-smi", "monitor", "--csv", NULL};
-static char *amdsmi_static_argv[] = {"/opt/rocm/bin/amd-smi", "static", "--csv", NULL};
+static char *amdsmi_metric_argv[] = {"/opt/rocm/bin/amd-smi", "metric", "--csv", NULL};
+static char *amdsmi_rocm_smi_argv[] = {"/opt/rocm/bin/amd-smi", "--rocm-smi", NULL};
+static char *amdsmi_static_argv[] = {"/opt/rocm/bin/amd-smi", "static", NULL};
 
 // Helper to run a command and capture output via fork+exec
 static inline ssize_t run_cmd(char *const argv[], char *buf, size_t buf_size) {
@@ -301,6 +302,44 @@ static inline char *next_amdgpu_item(char *line) {
   }
 }
 
+static inline int find_csv_col(const char *header, const char *name) {
+  int col = 0;
+  const char *p = header;
+  size_t namelen = strlen(name);
+  while (*p && *p != '\n') {
+    const char *start = p;
+    while (*p && *p != ',' && *p != '\n') p++;
+    if ((size_t)(p - start) == namelen && memcmp(start, name, namelen) == 0)
+      return col;
+    if (*p == ',') p++;
+    col++;
+  }
+  return -1;
+}
+
+static inline int csv_field_u32(const char *line, int col, uint32_t *out) {
+  if (col < 0) return 0;
+  int c = 0;
+  const char *p = line;
+  while (*p && *p != '\n') {
+    const char *start = p;
+    while (*p && *p != ',' && *p != '\n') p++;
+    if (c == col) {
+      char buf[32];
+      size_t len = p - start;
+      if (!len || len >= sizeof(buf)) return 0;
+      memcpy(buf, start, len);
+      buf[len] = '\0';
+      int err = 0;
+      *out = str_to_u32(buf, &err);
+      return !err;
+    }
+    if (*p == ',') p++;
+    c++;
+  }
+  return 0;
+}
+
 static inline void get_nvidia_info(struct gpu_record *gpu, char*contents) {
   char *line = contents;
   for (size_t i = 0; i < MAX_NUM_GPUS; i++) {
@@ -366,92 +405,105 @@ static inline int get_amd_gpu_names(void) {
   if (n_read <= 0)
     return 0;
 
-  // Skip header line
   char *p = static_contents;
-  while (*p && *p != '\n')
-    p++;
-  if (*p) p++;
-
-  // Parse each GPU line
   while (*p && shm->amd_gpu_count < MAX_NUM_GPUS) {
-    // Skip gpu id column (e.g. "0,")
-    while (*p && *p != ',')
-      p++;
-    if (*p == ',') p++;
+    char *marketo = strstr(p, "MARKET_NAME:");
+    if (!marketo)
+      break;
+    marketo += 12;
+    while (*marketo == ' ')
+      marketo++;
 
-    // Copy name until delimiter
-    char *dst = shm->amd_gpu_names[shm->amd_gpu_count];
-    while (*p && *p != ',' && *p != '\n')
-      *dst++ = *p++;
-    *dst = '\0';
+    char *end = marketo;
+    while (*end && *end != '\n')
+      end++;
 
-    // Skip to next line
-    while (*p && *p != '\n')
-      p++;
-    if (*p == '\n') p++;
+    size_t len = end - marketo;
+    if (len >= 256)
+      len = 255;
 
+    memcpy(shm->amd_gpu_names[shm->amd_gpu_count], marketo, len);
+    shm->amd_gpu_names[shm->amd_gpu_count][len] = '\0';
     shm->amd_gpu_count++;
+
+    p = end + 1;
   }
 
   return shm->amd_gpu_count > 0;
 }
 
-static inline void get_amd_info(struct gpu_record *gpu, char *contents) {
-  // Skip header line
-  char *line = contents;
-  while (*line != '\n')
-    line++;
-  line++;
+static inline void get_amd_metric_info(struct gpu_record *gpu) {
+  char metric_contents[PAGE_SIZE];
+  ssize_t n_read = run_cmd(amdsmi_metric_argv, metric_contents, sizeof(metric_contents));
+  if (n_read <= 0)
+    return;
 
   if (!get_amd_gpu_names())
     return;
 
-  // Fields: gpu,xcp,power_usage,hotspot_temperature,memory_temperature,
-  //         gfx_clk,gfx,mem,encoder,decoder,vram_used,vram_total
-  for (size_t i = 0; i < MAX_NUM_GPUS; i++) {
-    if (*line == '\n')
-      break;
+  int col_vram_total = find_csv_col(metric_contents, "total_vram");
+  int col_vram_used  = find_csv_col(metric_contents, "used_vram");
+  int col_gtt_total  = find_csv_col(metric_contents, "total_gtt");
+  int col_gtt_used   = find_csv_col(metric_contents, "used_gtt");
 
-    line = next_amdgpu_item(line); // gpu
-    line = next_amdgpu_item(line); // xcp
+  char *line = metric_contents;
+  while (*line && *line != '\n') line++;
+  if (*line) line++;
 
-    char *power_usage = line;
-    line = next_amdgpu_item(line);
-    char *hotspot_temperature = line;
-    line = next_amdgpu_item(line);
-    line = next_amdgpu_item(line); // memory_temperature
-    char *gfx_clk = line;
-    line = next_amdgpu_item(line);
-    char *gfx = line;
-    line = next_amdgpu_item(line);
-    line = next_amdgpu_item(line); // mem
-    line = next_amdgpu_item(line); // encoder
-    line = next_amdgpu_item(line); // decoder
+  uint32_t vram_total = 0, vram_used = 0, gtt_total = 0, gtt_used = 0;
+  int ok = csv_field_u32(line, col_vram_total, &vram_total) &
+           csv_field_u32(line, col_vram_used, &vram_used);
+  csv_field_u32(line, col_gtt_total, &gtt_total);
+  csv_field_u32(line, col_gtt_used, &gtt_used);
 
-    char *vram_used = line;
-    line = next_amdgpu_item(line);
-    char *vram_total = line;
-    line = next_amdgpu_item(line);
-
-    int err = 0;
-    strcpy(gpu->gpu[i].gpu_name, shm->amd_gpu_names[i < shm->amd_gpu_count ? i : 0]);
-    gpu->gpu[i].gpu_sm_utilization = str_to_u32(gfx, &err);
-    gpu->gpu[i].gpu_mem_total = str_to_u32(vram_total, &err);
-    gpu->gpu[i].gpu_mem_used = str_to_u32(vram_used, &err);
-    gpu->gpu[i].gpu_mem_free = gpu->gpu[i].gpu_mem_total - gpu->gpu[i].gpu_mem_used;
-    gpu->gpu[i].gpu_mem_used_percentage =
-        100.0 * ((float)gpu->gpu[i].gpu_mem_used / (float)gpu->gpu[i].gpu_mem_total);
-    gpu->gpu[i].gpu_graphics_clock = str_to_u32(gfx_clk, &err);
-    gpu->gpu[i].gpu_power_draw = str_to_u32(power_usage, &err);
-    gpu->gpu[i].gpu_temp = str_to_u32(hotspot_temperature, &err);
-    if (err)
-      puts("Failed to parse amd-smi output."), exit(1);
-
-    gpu->num_gpus++;
-    if (!*line)
-      break;
+  if (ok) {
+    gpu->gpu[0].gpu_mem_total = vram_total + gtt_total;
+    gpu->gpu[0].gpu_mem_used = vram_used + gtt_used;
+    gpu->gpu[0].gpu_mem_free = gpu->gpu[0].gpu_mem_total - gpu->gpu[0].gpu_mem_used;
+    gpu->gpu[0].gpu_mem_used_percentage =
+        100.0 * ((float)gpu->gpu[0].gpu_mem_used / (float)gpu->gpu[0].gpu_mem_total);
   }
+
+  char rocm_contents[PAGE_SIZE];
+  n_read = run_cmd(amdsmi_rocm_smi_argv, rocm_contents, sizeof(rocm_contents));
+  if (n_read > 0) {
+    char *rline = rocm_contents;
+    for (int i = 0; i < 5 && *rline; i++) {
+      while (*rline && *rline != '\n')
+        rline++;
+      if (*rline) rline++;
+    }
+    if (*rline) {
+      char *last_percent = NULL;
+      char *second_last_percent = NULL;
+      char *rp = rline;
+      while (*rp) {
+        if (*rp == '%') {
+          second_last_percent = last_percent;
+          last_percent = rp;
+        }
+        rp++;
+      }
+      if (last_percent && second_last_percent) {
+        char *gpu_percent_pos = second_last_percent;
+        while (gpu_percent_pos > rline && *(gpu_percent_pos - 1) != ' ')
+          gpu_percent_pos--;
+        char val[16];
+        int len = second_last_percent - gpu_percent_pos;
+        if (len > 0 && len < 15) {
+          memcpy(val, gpu_percent_pos, len);
+          val[len] = '\0';
+          int err = 0;
+          gpu->gpu[0].gpu_sm_utilization = str_to_u32(val, &err);
+        }
+      }
+    }
+  }
+
+  gpu->num_gpus = 1;
+  strcpy(gpu->gpu[0].gpu_name, shm->amd_gpu_names[0]);
 }
+
 
 static inline void get_gpu_info(struct gpu_record *gpu) {
   gpu->num_gpus = 0;
@@ -466,9 +518,7 @@ static inline void get_gpu_info(struct gpu_record *gpu) {
       get_nvidia_info(gpu, contents);
     return;
   case GPU_VENDOR_AMD:
-    n_read = run_cmd(amdsmi_monitor_argv, contents, sizeof(contents));
-    if (n_read > 0)
-      get_amd_info(gpu, contents);
+    get_amd_metric_info(gpu);
     return;
   case GPU_VENDOR_NONE:
     return;
@@ -482,10 +532,10 @@ static inline void get_gpu_info(struct gpu_record *gpu) {
     return;
   }
 
-  n_read = run_cmd(amdsmi_monitor_argv, contents, sizeof(contents));
+  n_read = run_cmd(amdsmi_metric_argv, contents, sizeof(contents));
   if (n_read > 0) {
     shm->gpu_vendor = GPU_VENDOR_AMD;
-    get_amd_info(gpu, contents);
+    get_amd_metric_info(gpu);
     return;
   }
 
