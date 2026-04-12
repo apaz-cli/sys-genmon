@@ -21,6 +21,7 @@ TMP="$(mktemp -d)"; cc -o "$TMP/a.out" -x c "$0" && "$TMP/a.out" $@; RVAL=$?; rm
 // 9. Network usage.
 // --------------------------------
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -123,6 +124,7 @@ typedef struct mem_record mem_record;
 struct shm_data {
   cpu_record prev_cpu;
   char amd_gpu_names[MAX_NUM_GPUS][256];
+  char amd_card_bases[MAX_NUM_GPUS][300];
   uint8_t amd_gpu_count;
   uint8_t gpu_vendor;
   uint8_t initialized;
@@ -147,10 +149,6 @@ static char *nvsmi_argv[] = {
     "temperature.gpu",
     "--format=csv,noheader,nounits",
     NULL};
-static char *amdsmi_metric_argv[] = {"/opt/rocm/bin/amd-smi", "metric", "--csv", NULL};
-static char *amdsmi_rocm_smi_argv[] = {"/opt/rocm/bin/amd-smi", "--rocm-smi", NULL};
-static char *amdsmi_static_argv[] = {"/opt/rocm/bin/amd-smi", "static", NULL};
-
 // Helper to run a command and capture output via fork+exec
 static inline ssize_t run_cmd(char *const argv[], char *buf, size_t buf_size) {
   int pipefd[2];
@@ -292,52 +290,136 @@ static inline char *next_gpu_item(char *line) {
   }
 }
 
-static inline char *next_amdgpu_item(char *line) {
-  while (1) {
-    int lc = *line == ',';
-    int ln = *line == '\n';
-    if (lc | ln)
-      return *line = '\0', line+1;
-    line++;
-  }
+static inline int sysfs_read_u64(const char *path, uint64_t *out) {
+  FILE *f = fopen(path, "r");
+  if (!f) return -1;
+  char buf[32];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  if (!n) return -1;
+  buf[n] = '\0';
+  char *end;
+  errno = 0;
+  unsigned long long v = strtoull(buf, &end, 10);
+  if (errno || end == buf) return -1;
+  *out = (uint64_t)v;
+  return 0;
 }
 
-static inline int find_csv_col(const char *header, const char *name) {
-  int col = 0;
-  const char *p = header;
-  size_t namelen = strlen(name);
-  while (*p && *p != '\n') {
-    const char *start = p;
-    while (*p && *p != ',' && *p != '\n') p++;
-    if ((size_t)(p - start) == namelen && memcmp(start, name, namelen) == 0)
-      return col;
-    if (*p == ',') p++;
-    col++;
+static inline int sysfs_read_u32(const char *path, uint32_t *out) {
+  uint64_t v;
+  int r = sysfs_read_u64(path, &v);
+  if (r == 0) *out = (uint32_t)v;
+  return r;
+}
+
+static inline int find_hwmon_base(const char *card_device_path, char *out_path, size_t out_size) {
+  char hwmon_dir[1024];
+  snprintf(hwmon_dir, sizeof(hwmon_dir), "%s/hwmon", card_device_path);
+  DIR *d = opendir(hwmon_dir);
+  if (!d) return -1;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (strncmp(ent->d_name, "hwmon", 5) == 0 && ent->d_name[5] != '\0') {
+      snprintf(out_path, out_size, "%s/%s", hwmon_dir, ent->d_name);
+      closedir(d);
+      return 0;
+    }
   }
+  closedir(d);
   return -1;
 }
 
-static inline int csv_field_u32(const char *line, int col, uint32_t *out) {
-  if (col < 0) return 0;
-  int c = 0;
-  const char *p = line;
-  while (*p && *p != '\n') {
-    const char *start = p;
-    while (*p && *p != ',' && *p != '\n') p++;
-    if (c == col) {
-      char buf[32];
-      size_t len = p - start;
-      if (!len || len >= sizeof(buf)) return 0;
-      memcpy(buf, start, len);
-      buf[len] = '\0';
-      int err = 0;
-      *out = str_to_u32(buf, &err);
-      return !err;
+static inline int parse_dpm_current_mhz(const char *path, uint32_t *out) {
+  FILE *f = fopen(path, "r");
+  if (!f) return -1;
+  char line[64];
+  int found = -1;
+  while (fgets(line, sizeof(line), f)) {
+    if (strchr(line, '*')) {
+      char *mhz = strstr(line, "Mhz");
+      if (!mhz) { found = -1; continue; }
+      char *p = mhz - 1;
+      while (p > line && *p >= '0' && *p <= '9') p--;
+      p++;
+      errno = 0;
+      unsigned long v = strtoul(p, NULL, 10);
+      if (!errno) { *out = (uint32_t)v; found = 0; }
     }
-    if (*p == ',') p++;
-    c++;
   }
-  return 0;
+  fclose(f);
+  return found;
+}
+
+static inline int amd_enumerate_gpus(void) {
+  if (shm->amd_gpu_count > 0)
+    return 1;
+
+  DIR *d = opendir("/sys/class/drm");
+  if (!d) return 0;
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL && shm->amd_gpu_count < MAX_NUM_GPUS) {
+    if (strncmp(ent->d_name, "card", 4) != 0) continue;
+    const char *p = ent->d_name + 4;
+    if (!*p) continue;
+    int all_digits = 1;
+    for (const char *q = p; *q; q++)
+      if (*q < '0' || *q > '9') { all_digits = 0; break; }
+    if (!all_digits) continue;
+
+    char vendor_path[300];
+    snprintf(vendor_path, sizeof(vendor_path), "/sys/class/drm/%s/device/vendor", ent->d_name);
+    FILE *vf = fopen(vendor_path, "r");
+    if (!vf) continue;
+    char vendor_buf[16];
+    size_t n = fread(vendor_buf, 1, sizeof(vendor_buf) - 1, vf);
+    fclose(vf);
+    if (!n) continue;
+    vendor_buf[n] = '\0';
+    while (n > 0 && (vendor_buf[n-1] == '\n' || vendor_buf[n-1] == '\r' || vendor_buf[n-1] == ' '))
+      vendor_buf[--n] = '\0';
+    if (strcmp(vendor_buf, "0x1002") != 0) continue;
+
+    int idx = shm->amd_gpu_count;
+    snprintf(shm->amd_card_bases[idx], sizeof(shm->amd_card_bases[idx]),
+             "/sys/class/drm/%s", ent->d_name);
+
+    // Get GPU name: try product_name first, fall back to uevent PCI_ID
+    char name_path[512];
+    snprintf(name_path, sizeof(name_path), "%s/device/product_name", shm->amd_card_bases[idx]);
+    FILE *nf = fopen(name_path, "r");
+    if (nf) {
+      size_t nn = fread(shm->amd_gpu_names[idx], 1, sizeof(shm->amd_gpu_names[idx]) - 1, nf);
+      fclose(nf);
+      while (nn > 0 && (shm->amd_gpu_names[idx][nn-1] == '\n' || shm->amd_gpu_names[idx][nn-1] == '\r'))
+        shm->amd_gpu_names[idx][--nn] = '\0';
+      shm->amd_gpu_names[idx][nn] = '\0';
+    } else {
+      char uevent_path[512];
+      snprintf(uevent_path, sizeof(uevent_path), "%s/device/uevent", shm->amd_card_bases[idx]);
+      FILE *uf = fopen(uevent_path, "r");
+      char pci_id[32] = "????:????";
+      if (uf) {
+        char uline[128];
+        while (fgets(uline, sizeof(uline), uf)) {
+          if (strncmp(uline, "PCI_ID=", 7) == 0) {
+            char *val = uline + 7;
+            size_t vl = strlen(val);
+            while (vl > 0 && (val[vl-1] == '\n' || val[vl-1] == '\r')) val[--vl] = '\0';
+            snprintf(pci_id, sizeof(pci_id), "%s", val);
+            break;
+          }
+        }
+        fclose(uf);
+      }
+      snprintf(shm->amd_gpu_names[idx], sizeof(shm->amd_gpu_names[idx]), "AMD GPU [%s]", pci_id);
+    }
+
+    shm->amd_gpu_count++;
+  }
+  closedir(d);
+  return shm->amd_gpu_count > 0;
 }
 
 static inline void get_nvidia_info(struct gpu_record *gpu, char*contents) {
@@ -396,112 +478,61 @@ static inline void get_nvidia_info(struct gpu_record *gpu, char*contents) {
   }
 }
 
-static inline int get_amd_gpu_names(void) {
-  if (shm->amd_gpu_count > 0)
-    return 1;
-
-  char static_contents[PAGE_SIZE * MAX_NUM_GPUS];
-  ssize_t n_read = run_cmd(amdsmi_static_argv, static_contents, sizeof(static_contents));
-  if (n_read <= 0)
-    return 0;
-
-  char *p = static_contents;
-  while (*p && shm->amd_gpu_count < MAX_NUM_GPUS) {
-    char *marketo = strstr(p, "MARKET_NAME:");
-    if (!marketo)
-      break;
-    marketo += 12;
-    while (*marketo == ' ')
-      marketo++;
-
-    char *end = marketo;
-    while (*end && *end != '\n')
-      end++;
-
-    size_t len = end - marketo;
-    if (len >= 256)
-      len = 255;
-
-    memcpy(shm->amd_gpu_names[shm->amd_gpu_count], marketo, len);
-    shm->amd_gpu_names[shm->amd_gpu_count][len] = '\0';
-    shm->amd_gpu_count++;
-
-    p = end + 1;
-  }
-
-  return shm->amd_gpu_count > 0;
-}
-
 static inline void get_amd_metric_info(struct gpu_record *gpu) {
-  char metric_contents[PAGE_SIZE];
-  ssize_t n_read = run_cmd(amdsmi_metric_argv, metric_contents, sizeof(metric_contents));
-  if (n_read <= 0)
+  if (!amd_enumerate_gpus())
     return;
 
-  if (!get_amd_gpu_names())
-    return;
+  const char *card_base = shm->amd_card_bases[0];
+  char dev[512];
+  snprintf(dev, sizeof(dev), "%s/device", card_base);
 
-  int col_vram_total = find_csv_col(metric_contents, "total_vram");
-  int col_vram_used  = find_csv_col(metric_contents, "used_vram");
-  int col_gtt_total  = find_csv_col(metric_contents, "total_gtt");
-  int col_gtt_used   = find_csv_col(metric_contents, "used_gtt");
+  uint64_t vram_total = 0, vram_used = 0, gtt_total = 0, gtt_used = 0;
+  char path[4096];
 
-  char *line = metric_contents;
-  while (*line && *line != '\n') line++;
-  if (*line) line++;
+  snprintf(path, sizeof(path), "%s/mem_info_vram_total", dev);
+  sysfs_read_u64(path, &vram_total);
+  snprintf(path, sizeof(path), "%s/mem_info_vram_used", dev);
+  sysfs_read_u64(path, &vram_used);
+  snprintf(path, sizeof(path), "%s/mem_info_gtt_total", dev);
+  sysfs_read_u64(path, &gtt_total);
+  snprintf(path, sizeof(path), "%s/mem_info_gtt_used", dev);
+  sysfs_read_u64(path, &gtt_used);
 
-  uint32_t vram_total = 0, vram_used = 0, gtt_total = 0, gtt_used = 0;
-  int ok = csv_field_u32(line, col_vram_total, &vram_total) &
-           csv_field_u32(line, col_vram_used, &vram_used);
-  csv_field_u32(line, col_gtt_total, &gtt_total);
-  csv_field_u32(line, col_gtt_used, &gtt_used);
+  uint64_t mem_total_mb = (vram_total + gtt_total) / 1048576;
+  uint64_t mem_used_mb  = (vram_used  + gtt_used)  / 1048576;
+  gpu->gpu[0].gpu_mem_total = (uint32_t)mem_total_mb;
+  gpu->gpu[0].gpu_mem_used  = (uint32_t)mem_used_mb;
+  gpu->gpu[0].gpu_mem_free  = (uint32_t)(mem_total_mb - mem_used_mb);
+  if (mem_total_mb > 0)
+    gpu->gpu[0].gpu_mem_used_percentage = 100.0f * (float)mem_used_mb / (float)mem_total_mb;
 
-  if (ok) {
-    gpu->gpu[0].gpu_mem_total = vram_total + gtt_total;
-    gpu->gpu[0].gpu_mem_used = vram_used + gtt_used;
-    gpu->gpu[0].gpu_mem_free = gpu->gpu[0].gpu_mem_total - gpu->gpu[0].gpu_mem_used;
-    gpu->gpu[0].gpu_mem_used_percentage =
-        100.0 * ((float)gpu->gpu[0].gpu_mem_used / (float)gpu->gpu[0].gpu_mem_total);
+  snprintf(path, sizeof(path), "%s/gpu_busy_percent", dev);
+  sysfs_read_u32(path, &gpu->gpu[0].gpu_sm_utilization);
+
+  snprintf(path, sizeof(path), "%s/mem_busy_percent", dev);
+  sysfs_read_u32(path, &gpu->gpu[0].gpu_mem_bandwidth_utilization);
+
+  char hwmon_base[2048];
+  if (find_hwmon_base(dev, hwmon_base, sizeof(hwmon_base)) == 0) {
+    uint32_t t = 0, pw = 0;
+    snprintf(path, sizeof(path), "%s/temp1_input", hwmon_base);
+    if (sysfs_read_u32(path, &t) == 0)
+      gpu->gpu[0].gpu_temp = t / 1000;
+    snprintf(path, sizeof(path), "%s/power1_average", hwmon_base);
+    if (sysfs_read_u32(path, &pw) != 0) {
+      snprintf(path, sizeof(path), "%s/power1_input", hwmon_base);
+      sysfs_read_u32(path, &pw);
+    }
+    gpu->gpu[0].gpu_power_draw = pw / 1000000;
   }
 
-  char rocm_contents[PAGE_SIZE];
-  n_read = run_cmd(amdsmi_rocm_smi_argv, rocm_contents, sizeof(rocm_contents));
-  if (n_read > 0) {
-    char *rline = rocm_contents;
-    for (int i = 0; i < 5 && *rline; i++) {
-      while (*rline && *rline != '\n')
-        rline++;
-      if (*rline) rline++;
-    }
-    if (*rline) {
-      char *last_percent = NULL;
-      char *second_last_percent = NULL;
-      char *rp = rline;
-      while (*rp) {
-        if (*rp == '%') {
-          second_last_percent = last_percent;
-          last_percent = rp;
-        }
-        rp++;
-      }
-      if (last_percent && second_last_percent) {
-        char *gpu_percent_pos = second_last_percent;
-        while (gpu_percent_pos > rline && *(gpu_percent_pos - 1) != ' ')
-          gpu_percent_pos--;
-        char val[16];
-        int len = second_last_percent - gpu_percent_pos;
-        if (len > 0 && len < 15) {
-          memcpy(val, gpu_percent_pos, len);
-          val[len] = '\0';
-          int err = 0;
-          gpu->gpu[0].gpu_sm_utilization = str_to_u32(val, &err);
-        }
-      }
-    }
-  }
+  snprintf(path, sizeof(path), "%s/pp_dpm_sclk", dev);
+  parse_dpm_current_mhz(path, &gpu->gpu[0].gpu_graphics_clock);
+  snprintf(path, sizeof(path), "%s/pp_dpm_mclk", dev);
+  parse_dpm_current_mhz(path, &gpu->gpu[0].gpu_mem_clock);
 
-  gpu->num_gpus = 1;
   strcpy(gpu->gpu[0].gpu_name, shm->amd_gpu_names[0]);
+  gpu->num_gpus = 1;
 }
 
 
@@ -532,8 +563,7 @@ static inline void get_gpu_info(struct gpu_record *gpu) {
     return;
   }
 
-  n_read = run_cmd(amdsmi_metric_argv, contents, sizeof(contents));
-  if (n_read > 0) {
+  if (amd_enumerate_gpus()) {
     shm->gpu_vendor = GPU_VENDOR_AMD;
     get_amd_metric_info(gpu);
     return;
